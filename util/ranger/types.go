@@ -16,42 +16,17 @@ package ranger
 import (
 	"fmt"
 	"math"
-	"strconv"
 	"strings"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/codec"
 )
 
-// IntColumnRange represents a range for a integer column, both low and high are inclusive.
-type IntColumnRange struct {
-	LowVal  int64
-	HighVal int64
-}
-
-// IsPoint returns if the table range is a point.
-func (tr *IntColumnRange) IsPoint() bool {
-	return tr.HighVal == tr.LowVal
-}
-
-func (tr IntColumnRange) String() string {
-	var l, r string
-	if tr.LowVal == math.MinInt64 {
-		l = "(-inf"
-	} else {
-		l = "[" + strconv.FormatInt(tr.LowVal, 10)
-	}
-	if tr.HighVal == math.MaxInt64 {
-		r = "+inf)"
-	} else {
-		r = strconv.FormatInt(tr.HighVal, 10) + "]"
-	}
-	return l + "," + r
-}
-
-// NewRange represents a range generated in physical plan building phase.
-type NewRange struct {
+// Range represents a range generated in physical plan building phase.
+type Range struct {
 	LowVal  []types.Datum
 	HighVal []types.Datum
 
@@ -59,9 +34,9 @@ type NewRange struct {
 	HighExclude bool // High value is exclusive.
 }
 
-// Clone clones a NewRange.
-func (ran *NewRange) Clone() *NewRange {
-	newRange := &NewRange{
+// Clone clones a Range.
+func (ran *Range) Clone() *Range {
+	newRange := &Range{
 		LowVal:      make([]types.Datum, 0, len(ran.LowVal)),
 		HighVal:     make([]types.Datum, 0, len(ran.HighVal)),
 		LowExclude:  ran.LowExclude,
@@ -77,7 +52,7 @@ func (ran *NewRange) Clone() *NewRange {
 }
 
 // IsPoint returns if the range is a point.
-func (ran *NewRange) IsPoint(sc *stmtctx.StatementContext) bool {
+func (ran *Range) IsPoint(sc *stmtctx.StatementContext) bool {
 	if len(ran.LowVal) != len(ran.HighVal) {
 		return false
 	}
@@ -94,19 +69,39 @@ func (ran *NewRange) IsPoint(sc *stmtctx.StatementContext) bool {
 		if cmp != 0 {
 			return false
 		}
+
+		if a.IsNull() {
+			return false
+		}
 	}
 	return !ran.LowExclude && !ran.HighExclude
 }
 
-// Convert2NewRange implements the Convert2NewRange interface.
-func (ran *NewRange) String() string {
+//IsFullRange check if the range is full scan range
+func (ran *Range) IsFullRange() bool {
+	if len(ran.LowVal) != len(ran.HighVal) {
+		return false
+	}
+	for i := range ran.LowVal {
+		lowValRawString := formatDatum(ran.LowVal[i], true)
+		highValRawString := formatDatum(ran.HighVal[i], false)
+		if ("-inf" != lowValRawString && "NULL" != lowValRawString) ||
+			("+inf" != highValRawString && "NULL" != highValRawString) {
+			return false
+		}
+	}
+	return true
+}
+
+// String implements the Stringer interface.
+func (ran *Range) String() string {
 	lowStrs := make([]string, 0, len(ran.LowVal))
 	for _, d := range ran.LowVal {
-		lowStrs = append(lowStrs, formatDatum(d))
+		lowStrs = append(lowStrs, formatDatum(d, true))
 	}
 	highStrs := make([]string, 0, len(ran.LowVal))
 	for _, d := range ran.HighVal {
-		highStrs = append(highStrs, formatDatum(d))
+		highStrs = append(highStrs, formatDatum(d, false))
 	}
 	l, r := "[", "]"
 	if ran.LowExclude {
@@ -118,9 +113,29 @@ func (ran *NewRange) String() string {
 	return l + strings.Join(lowStrs, " ") + "," + strings.Join(highStrs, " ") + r
 }
 
+// Encode encodes the range to its encoded value.
+func (ran *Range) Encode(sc *stmtctx.StatementContext, lowBuffer, highBuffer []byte) ([]byte, []byte, error) {
+	var err error
+	lowBuffer, err = codec.EncodeKey(sc, lowBuffer[:0], ran.LowVal...)
+	if err != nil {
+		return nil, nil, err
+	}
+	if ran.LowExclude {
+		lowBuffer = kv.Key(lowBuffer).PrefixNext()
+	}
+	highBuffer, err = codec.EncodeKey(sc, highBuffer[:0], ran.HighVal...)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ran.HighExclude {
+		highBuffer = kv.Key(highBuffer).PrefixNext()
+	}
+	return lowBuffer, highBuffer, nil
+}
+
 // PrefixEqualLen tells you how long the prefix of the range is a point.
 // e.g. If this range is (1 2 3, 1 2 +inf), then the return value is 2.
-func (ran *NewRange) PrefixEqualLen(sc *stmtctx.StatementContext) (int, error) {
+func (ran *Range) PrefixEqualLen(sc *stmtctx.StatementContext) (int, error) {
 	// Here, len(ran.LowVal) always equal to len(ran.HighVal)
 	for i := 0; i < len(ran.LowVal); i++ {
 		cmp, err := ran.LowVal[i].CompareDatum(sc, &ran.HighVal[i])
@@ -134,12 +149,32 @@ func (ran *NewRange) PrefixEqualLen(sc *stmtctx.StatementContext) (int, error) {
 	return len(ran.LowVal), nil
 }
 
-func formatDatum(d types.Datum) string {
-	if d.Kind() == types.KindMinNotNull {
+func formatDatum(d types.Datum, isLeftSide bool) string {
+	switch d.Kind() {
+	case types.KindNull:
+		return "NULL"
+	case types.KindMinNotNull:
 		return "-inf"
-	}
-	if d.Kind() == types.KindMaxValue {
+	case types.KindMaxValue:
 		return "+inf"
+	case types.KindInt64:
+		switch d.GetInt64() {
+		case math.MinInt64:
+			if isLeftSide {
+				return "-inf"
+			}
+		case math.MaxInt64:
+			if !isLeftSide {
+				return "+inf"
+			}
+		}
+	case types.KindUint64:
+		if d.GetUint64() == math.MaxUint64 && !isLeftSide {
+			return "+inf"
+		}
+	case types.KindString, types.KindBytes, types.KindMysqlEnum, types.KindMysqlSet,
+		types.KindMysqlJSON, types.KindBinaryLiteral, types.KindMysqlBit:
+		return fmt.Sprintf("\"%v\"", d.GetValue())
 	}
 	return fmt.Sprintf("%v", d.GetValue())
 }

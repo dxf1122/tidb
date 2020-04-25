@@ -14,19 +14,25 @@
 package tikv
 
 import (
+	"context"
 	"crypto/tls"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/juju/errors"
-	log "github.com/sirupsen/logrus"
-	goctx "golang.org/x/net/context"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/mvcc/mvccpb"
+	"go.uber.org/zap"
 )
 
 // Safe point constants.
 const (
+	// This is almost the same as 'tikv_gc_safe_point' in the table 'mysql.tidb',
+	// save this to pd instead of tikv, because we can't use interface of table
+	// if the safepoint on tidb is expired.
 	GcSavedSafePoint = "/tidb/store/gcworker/saved_safe_point"
 
 	GcSafePointCacheInterval       = time.Second * 100
@@ -39,6 +45,7 @@ const (
 type SafePointKV interface {
 	Put(k string, v string) error
 	Get(k string) (string, error)
+	GetWithPrefix(k string) ([]*mvccpb.KeyValue, error)
 }
 
 // MockSafePointKV implements SafePointKV at mock test
@@ -66,8 +73,21 @@ func (w *MockSafePointKV) Put(k string, v string) error {
 func (w *MockSafePointKV) Get(k string) (string, error) {
 	w.mockLock.RLock()
 	defer w.mockLock.RUnlock()
-	elem, _ := w.store[k]
+	elem := w.store[k]
 	return elem, nil
+}
+
+// GetWithPrefix implements the Get method for SafePointKV
+func (w *MockSafePointKV) GetWithPrefix(prefix string) ([]*mvccpb.KeyValue, error) {
+	w.mockLock.RLock()
+	defer w.mockLock.RUnlock()
+	kvs := make([]*mvccpb.KeyValue, 0, len(w.store))
+	for k, v := range w.store {
+		if strings.HasPrefix(k, prefix) {
+			kvs = append(kvs, &mvccpb.KeyValue{Key: []byte(k), Value: []byte(v)})
+		}
+	}
+	return kvs, nil
 }
 
 // EtcdSafePointKV implements SafePointKV at runtime
@@ -86,7 +106,7 @@ func NewEtcdSafePointKV(addrs []string, tlsConfig *tls.Config) (*EtcdSafePointKV
 
 // Put implements the Put method for SafePointKV
 func (w *EtcdSafePointKV) Put(k string, v string) error {
-	ctx, cancel := goctx.WithTimeout(goctx.Background(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	_, err := w.cli.Put(ctx, k, v)
 	cancel()
 	if err != nil {
@@ -97,7 +117,7 @@ func (w *EtcdSafePointKV) Put(k string, v string) error {
 
 // Get implements the Get method for SafePointKV
 func (w *EtcdSafePointKV) Get(k string) (string, error) {
-	ctx, cancel := goctx.WithTimeout(goctx.Background(), time.Second*5)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	resp, err := w.cli.Get(ctx, k)
 	cancel()
 	if err != nil {
@@ -109,17 +129,28 @@ func (w *EtcdSafePointKV) Get(k string) (string, error) {
 	return "", nil
 }
 
-func saveSafePoint(kv SafePointKV, key string, t uint64) error {
+// GetWithPrefix implements the GetWithPrefix for SafePointKV
+func (w *EtcdSafePointKV) GetWithPrefix(k string) ([]*mvccpb.KeyValue, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+	resp, err := w.cli.Get(ctx, k, clientv3.WithPrefix())
+	cancel()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return resp.Kvs, nil
+}
+
+func saveSafePoint(kv SafePointKV, t uint64) error {
 	s := strconv.FormatUint(t, 10)
 	err := kv.Put(GcSavedSafePoint, s)
 	if err != nil {
-		log.Error("save safepoint failed:", err)
+		logutil.BgLogger().Error("save safepoint failed", zap.Error(err))
 		return errors.Trace(err)
 	}
 	return nil
 }
 
-func loadSafePoint(kv SafePointKV, key string) (uint64, error) {
+func loadSafePoint(kv SafePointKV) (uint64, error) {
 	str, err := kv.Get(GcSavedSafePoint)
 
 	if err != nil {

@@ -18,22 +18,22 @@ import (
 	"math"
 	"sort"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/collate"
 )
 
 // Error instances.
 var (
-	ErrUnsupportedType = terror.ClassOptimizerPlan.New(CodeUnsupportedType, "Unsupported type")
-)
-
-// Error codes.
-const (
-	CodeUnsupportedType terror.ErrCode = 1
+	ErrUnsupportedType = terror.ClassOptimizer.New(errno.ErrUnsupportedType, errno.MySQLErrName[errno.ErrUnsupportedType])
 )
 
 // RangeType is alias for int.
@@ -123,20 +123,35 @@ var fullRange = []point{
 	{value: types.MaxValueDatum()},
 }
 
-// FullIntRange is (-∞, +∞) for IntColumnRange.
-func FullIntRange() []IntColumnRange {
-	return []IntColumnRange{{LowVal: math.MinInt64, HighVal: math.MaxInt64}}
+// FullIntRange is used for table range. Since table range cannot accept MaxValueDatum as the max value.
+// So we need to set it to MaxInt64.
+func FullIntRange(isUnsigned bool) []*Range {
+	if isUnsigned {
+		return []*Range{{LowVal: []types.Datum{types.NewUintDatum(0)}, HighVal: []types.Datum{types.NewUintDatum(math.MaxUint64)}}}
+	}
+	return []*Range{{LowVal: []types.Datum{types.NewIntDatum(math.MinInt64)}, HighVal: []types.Datum{types.NewIntDatum(math.MaxInt64)}}}
 }
 
-// FullNewRange is (-∞, +∞) for NewRange.
-func FullNewRange() []*NewRange {
-	return []*NewRange{{LowVal: []types.Datum{{}}, HighVal: []types.Datum{types.MaxValueDatum()}}}
+// FullRange is [null, +∞) for Range.
+func FullRange() []*Range {
+	return []*Range{{LowVal: []types.Datum{{}}, HighVal: []types.Datum{types.MaxValueDatum()}}}
+}
+
+// FullNotNullRange is (-∞, +∞) for Range.
+func FullNotNullRange() []*Range {
+	return []*Range{{LowVal: []types.Datum{types.MinNotNullDatum()}, HighVal: []types.Datum{types.MaxValueDatum()}}}
+}
+
+// NullRange is [null, null] for Range.
+func NullRange() []*Range {
+	return []*Range{{LowVal: []types.Datum{{}}, HighVal: []types.Datum{{}}}}
 }
 
 // builder is the range builder struct.
 type builder struct {
 	err error
 	sc  *stmtctx.StatementContext
+	ctx *sessionctx.Context
 }
 
 func (r *builder) build(expr expression.Expression) []point {
@@ -153,7 +168,7 @@ func (r *builder) build(expr expression.Expression) []point {
 }
 
 func (r *builder) buildFromConstant(expr *expression.Constant) []point {
-	dt, err := expr.Eval(nil)
+	dt, err := expr.Eval(chunk.Row{})
 	if err != nil {
 		r.err = err
 		return nil
@@ -188,11 +203,39 @@ func (r *builder) buildFromColumn(expr *expression.Column) []point {
 func (r *builder) buildFormBinOp(expr *expression.ScalarFunction) []point {
 	// This has been checked that the binary operation is comparison operation, and one of
 	// the operand is column name expression.
-	var value types.Datum
-	var op string
-	var err error
-	if v, ok := expr.GetArgs()[0].(*expression.Constant); ok {
-		value, err = v.Eval(nil)
+	var (
+		op    string
+		value types.Datum
+		err   error
+		ft    *types.FieldType
+	)
+
+	// refineValue refines the constant datum for string type since we may eval the constant to another collation instead of its own collation.
+	refineValue := func(col *expression.Column, value *types.Datum) {
+		if col.RetType.EvalType() == types.ETString && value.Kind() == types.KindString {
+			value.SetString(value.GetString(), col.RetType.Collate)
+		}
+	}
+	if col, ok := expr.GetArgs()[0].(*expression.Column); ok {
+		ft = col.RetType
+		value, err = expr.GetArgs()[1].Eval(chunk.Row{})
+		if err != nil {
+			return nil
+		}
+		refineValue(col, &value)
+		op = expr.FuncName.L
+	} else {
+		col, ok := expr.GetArgs()[1].(*expression.Column)
+		if !ok {
+			return nil
+		}
+		ft = col.RetType
+		value, err = expr.GetArgs()[0].Eval(chunk.Row{})
+		if err != nil {
+			return nil
+		}
+		refineValue(col, &value)
+
 		switch expr.FuncName.L {
 		case ast.GE:
 			op = ast.LE
@@ -205,14 +248,13 @@ func (r *builder) buildFormBinOp(expr *expression.ScalarFunction) []point {
 		default:
 			op = expr.FuncName.L
 		}
-	} else {
-		value, err = expr.GetArgs()[1].(*expression.Constant).Eval(nil)
-		op = expr.FuncName.L
-	}
-	if err != nil {
-		return nil
 	}
 	if value.IsNull() {
+		return nil
+	}
+
+	value, op, isValidRange := handleUnsignedIntCol(ft, value, op)
+	if !isValidRange {
 		return nil
 	}
 
@@ -245,6 +287,29 @@ func (r *builder) buildFormBinOp(expr *expression.ScalarFunction) []point {
 		return []point{startPoint, endPoint}
 	}
 	return nil
+}
+
+// handleUnsignedIntCol handles the case when unsigned column meets negative integer value.
+// The three returned values are: fixed constant value, fixed operator, and a boolean
+// which indicates whether the range is valid or not.
+func handleUnsignedIntCol(ft *types.FieldType, val types.Datum, op string) (types.Datum, string, bool) {
+	isUnsigned := mysql.HasUnsignedFlag(ft.Flag)
+	isIntegerType := mysql.IsIntegerType(ft.Tp)
+	isNegativeInteger := (val.Kind() == types.KindInt64 && val.GetInt64() < 0)
+
+	if !isUnsigned || !isIntegerType || !isNegativeInteger {
+		return val, op, true
+	}
+
+	// If the operator is GT, GE or NE, the range should be [0, +inf].
+	// Otherwise the value is out of valid range.
+	if op == ast.GT || op == ast.GE || op == ast.NE {
+		op = ast.GE
+		val.SetUint64(0)
+		return val, op, true
+	}
+
+	return val, op, false
 }
 
 func (r *builder) buildFromIsTrue(expr *expression.ScalarFunction, isNot int) []point {
@@ -291,23 +356,30 @@ func (r *builder) buildFromIn(expr *expression.ScalarFunction) ([]point, bool) {
 	list := expr.GetArgs()[1:]
 	rangePoints := make([]point, 0, len(list)*2)
 	hasNull := false
+	colCollate := expr.GetArgs()[0].GetType().Collate
 	for _, e := range list {
 		v, ok := e.(*expression.Constant)
 		if !ok {
-			r.err = ErrUnsupportedType.Gen("expr:%v is not constant", e)
+			r.err = ErrUnsupportedType.GenWithStack("expr:%v is not constant", e)
 			return fullRange, hasNull
 		}
-		dt, err := v.Eval(nil)
+		dt, err := v.Eval(chunk.Row{})
 		if err != nil {
-			r.err = ErrUnsupportedType.Gen("expr:%v is not evaluated", e)
+			r.err = ErrUnsupportedType.GenWithStack("expr:%v is not evaluated", e)
 			return fullRange, hasNull
 		}
 		if dt.IsNull() {
 			hasNull = true
 			continue
 		}
-		startPoint := point{value: types.NewDatum(dt.GetValue()), start: true}
-		endPoint := point{value: types.NewDatum(dt.GetValue())}
+		if dt.Kind() == types.KindString {
+			dt.SetString(dt.GetString(), colCollate)
+		}
+		var startValue, endValue types.Datum
+		dt.Copy(&startValue)
+		dt.Copy(&endValue)
+		startPoint := point{value: startValue, start: true}
+		endPoint := point{value: endValue}
 		rangePoints = append(rangePoints, startPoint, endPoint)
 	}
 	sorter := pointSorter{points: rangePoints, sc: r.sc}
@@ -333,7 +405,12 @@ func (r *builder) buildFromIn(expr *expression.ScalarFunction) ([]point, bool) {
 }
 
 func (r *builder) newBuildFromPatternLike(expr *expression.ScalarFunction) []point {
-	pdt, err := expr.GetArgs()[1].(*expression.Constant).Eval(nil)
+	_, collation, _ := expr.CharsetAndCollation(expr.GetCtx())
+	if !collate.CompatibleCollate(expr.GetArgs()[0].GetType().Collate, collation) {
+		return fullRange
+	}
+	pdt, err := expr.GetArgs()[1].(*expression.Constant).Eval(chunk.Row{})
+	tpOfPattern := expr.GetArgs()[0].GetType()
 	if err != nil {
 		r.err = errors.Trace(err)
 		return fullRange
@@ -349,7 +426,7 @@ func (r *builder) newBuildFromPatternLike(expr *expression.ScalarFunction) []poi
 		return []point{startPoint, endPoint}
 	}
 	lowValue := make([]byte, 0, len(pattern))
-	edt, err := expr.GetArgs()[2].(*expression.Constant).Eval(nil)
+	edt, err := expr.GetArgs()[2].(*expression.Constant).Eval(chunk.Row{})
 	if err != nil {
 		r.err = errors.Trace(err)
 		return fullRange
@@ -385,11 +462,11 @@ func (r *builder) newBuildFromPatternLike(expr *expression.ScalarFunction) []poi
 		return []point{{value: types.MinNotNullDatum(), start: true}, {value: types.MaxValueDatum()}}
 	}
 	if isExactMatch {
-		val := types.NewStringDatum(string(lowValue))
+		val := types.NewCollationStringDatum(string(lowValue), tpOfPattern.Collate, tpOfPattern.Flen)
 		return []point{{value: val, start: true}, {value: val}}
 	}
 	startPoint := point{start: true, excl: exclude}
-	startPoint.value.SetBytesAsString(lowValue)
+	startPoint.value.SetBytesAsString(lowValue, tpOfPattern.Collate, uint32(tpOfPattern.Flen))
 	highValue := make([]byte, len(lowValue))
 	copy(highValue, lowValue)
 	endPoint := point{excl: true}
@@ -399,7 +476,7 @@ func (r *builder) newBuildFromPatternLike(expr *expression.ScalarFunction) []poi
 		// e.g., the start point value is "abc", so the end point value is "abd".
 		highValue[i]++
 		if highValue[i] != 0 {
-			endPoint.value.SetBytesAsString(highValue)
+			endPoint.value.SetBytesAsString(highValue, tpOfPattern.Collate, uint32(tpOfPattern.Flen))
 			break
 		}
 		// If highValue[i] is 255 and highValue[i]++ is 0, then the end point value is max value.
@@ -417,11 +494,27 @@ func (r *builder) buildFromNot(expr *expression.ScalarFunction) []point {
 	case ast.IsFalsity:
 		return r.buildFromIsFalse(expr, 1)
 	case ast.In:
+		var (
+			isUnsignedIntCol bool
+			nonNegativePos   int
+		)
 		rangePoints, hasNull := r.buildFromIn(expr)
 		if hasNull {
 			return nil
 		}
-		retRangePoints := make([]point, 0, len(rangePoints)+2)
+		if x, ok := expr.GetArgs()[0].(*expression.Column); ok {
+			isUnsignedIntCol = mysql.HasUnsignedFlag(x.RetType.Flag) && mysql.IsIntegerType(x.RetType.Tp)
+		}
+		// negative ranges can be directly ignored for unsigned int columns.
+		if isUnsignedIntCol {
+			for nonNegativePos = 0; nonNegativePos < len(rangePoints); nonNegativePos += 2 {
+				if rangePoints[nonNegativePos].value.Kind() == types.KindUint64 || rangePoints[nonNegativePos].value.GetInt64() >= 0 {
+					break
+				}
+			}
+			rangePoints = rangePoints[nonNegativePos:]
+		}
+		retRangePoints := make([]point, 0, 2+len(rangePoints))
 		previousValue := types.Datum{}
 		for i := 0; i < len(rangePoints); i += 2 {
 			retRangePoints = append(retRangePoints, point{value: previousValue, start: true, excl: true})
@@ -434,7 +527,7 @@ func (r *builder) buildFromNot(expr *expression.ScalarFunction) []point {
 		return retRangePoints
 	case ast.Like:
 		// Pattern not like is not supported.
-		r.err = ErrUnsupportedType.Gen("NOT LIKE is not supported.")
+		r.err = ErrUnsupportedType.GenWithStack("NOT LIKE is not supported.")
 		return fullRange
 	case ast.IsNull:
 		startPoint := point{value: types.MinNotNullDatum(), start: true}
@@ -480,13 +573,37 @@ func (r *builder) union(a, b []point) []point {
 	return r.merge(a, b, true)
 }
 
+func (r *builder) mergeSorted(a, b []point) []point {
+	ret := make([]point, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		less, err := rangePointLess(r.sc, a[i], b[j])
+		if err != nil {
+			r.err = err
+			return nil
+		}
+		if less {
+			ret = append(ret, a[i])
+			i++
+		} else {
+			ret = append(ret, b[j])
+			j++
+		}
+	}
+	if i < len(a) {
+		ret = append(ret, a[i:]...)
+	} else if j < len(b) {
+		ret = append(ret, b[j:]...)
+	}
+	return ret
+}
+
 func (r *builder) merge(a, b []point, union bool) []point {
-	sorter := pointSorter{points: append(a, b...), sc: r.sc}
-	sort.Sort(&sorter)
-	if sorter.err != nil {
-		r.err = sorter.err
+	mergedPoints := r.mergeSorted(a, b)
+	if r.err != nil {
 		return nil
 	}
+
 	var (
 		inRangeCount         int
 		requiredInRangeCount int
@@ -496,21 +613,23 @@ func (r *builder) merge(a, b []point, union bool) []point {
 	} else {
 		requiredInRangeCount = 2
 	}
-	merged := make([]point, 0, len(sorter.points))
-	for _, val := range sorter.points {
+	curTail := 0
+	for _, val := range mergedPoints {
 		if val.start {
 			inRangeCount++
 			if inRangeCount == requiredInRangeCount {
-				// just reached the required in range count, a new range started.
-				merged = append(merged, val)
+				// Just reached the required in range count, a new range started.
+				mergedPoints[curTail] = val
+				curTail++
 			}
 		} else {
 			if inRangeCount == requiredInRangeCount {
-				// just about to leave the required in range count, the range is ended.
-				merged = append(merged, val)
+				// Just about to leave the required in range count, the range is ended.
+				mergedPoints[curTail] = val
+				curTail++
 			}
 			inRangeCount--
 		}
 	}
-	return merged
+	return mergedPoints[:curTail]
 }

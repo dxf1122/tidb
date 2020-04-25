@@ -14,18 +14,23 @@
 package ddl
 
 import (
+	"context"
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/util/mock"
-	"github.com/pingcap/tidb/util/testleak"
-	goctx "golang.org/x/net/context"
 )
 
 var _ = Suite(&testStatSuite{})
 
 type testStatSuite struct {
+}
+
+func (s *testStatSuite) SetUpSuite(c *C) {
+}
+
+func (s *testStatSuite) TearDownSuite(c *C) {
 }
 
 func (s *testStatSuite) getDDLSchemaVer(c *C, d *ddl) int64 {
@@ -36,14 +41,15 @@ func (s *testStatSuite) getDDLSchemaVer(c *C, d *ddl) int64 {
 }
 
 func (s *testStatSuite) TestStat(c *C) {
-	defer testleak.AfterTest(c)()
 	store := testCreateStore(c, "test_stat")
 	defer store.Close()
 
-	d := testNewDDL(goctx.Background(), nil, store, nil, nil, testLease)
+	d := newDDL(
+		context.Background(),
+		WithStore(store),
+		WithLease(testLease),
+	)
 	defer d.Stop()
-
-	time.Sleep(testLease)
 
 	dbInfo := testSchemaInfo(c, d, "test")
 	testCreateSchema(c, testNewContext(d), d, dbInfo)
@@ -69,15 +75,15 @@ func (s *testStatSuite) TestStat(c *C) {
 
 	ticker := time.NewTicker(d.lease * 1)
 	defer ticker.Stop()
-
 	ver := s.getDDLSchemaVer(c, d)
 LOOP:
 	for {
 		select {
 		case <-ticker.C:
-			d.close()
+			d.Stop()
 			c.Assert(s.getDDLSchemaVer(c, d), GreaterEqual, ver)
-			d.start(goctx.Background())
+			d.restartWorkers(context.Background())
+			time.Sleep(time.Millisecond * 20)
 		case err := <-done:
 			c.Assert(err, IsNil)
 			// TODO: Get this information from etcd.

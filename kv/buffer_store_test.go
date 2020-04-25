@@ -15,9 +15,10 @@ package kv
 
 import (
 	"bytes"
-	"fmt"
+	"context"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/terror"
 )
 
 type testBufferStoreSuite struct{}
@@ -27,37 +28,34 @@ var _ = Suite(testBufferStoreSuite{})
 func (s testBufferStoreSuite) TestGetSet(c *C) {
 	bs := NewBufferStore(&mockSnapshot{NewMemDbBuffer()})
 	key := Key("key")
-	value, err := bs.Get(key)
+	_, err := bs.Get(context.TODO(), key)
 	c.Check(err, NotNil)
 
 	err = bs.Set(key, []byte("value"))
 	c.Check(err, IsNil)
 
-	value, err = bs.Get(key)
+	value, err := bs.Get(context.TODO(), key)
 	c.Check(err, IsNil)
 	c.Check(bytes.Compare(value, []byte("value")), Equals, 0)
 }
 
-func (s testBufferStoreSuite) TestSaveTo(c *C) {
+func (s testBufferStoreSuite) TestBufferStore(c *C) {
 	bs := NewBufferStore(&mockSnapshot{NewMemDbBuffer()})
-	var buf bytes.Buffer
-	for i := 0; i < 10; i++ {
-		fmt.Fprint(&buf, i)
-		err := bs.Set(buf.Bytes(), buf.Bytes())
-		c.Check(err, IsNil)
-		buf.Reset()
-	}
-	bs.Set(Key("novalue"), nil)
-
-	mutator := NewMemDbBuffer()
-	err := bs.SaveTo(mutator)
+	key := Key("key")
+	err := bs.Set(key, []byte("value"))
 	c.Check(err, IsNil)
 
-	iter, err := mutator.Seek(nil)
+	err = bs.Set(key, []byte(""))
+	c.Check(terror.ErrorEqual(err, ErrCannotSetNilValue), IsTrue)
+
+	err = bs.Delete(key)
 	c.Check(err, IsNil)
-	for iter.Valid() {
-		cmp := bytes.Compare(iter.Key(), iter.Value())
-		c.Check(cmp, Equals, 0)
-		iter.Next()
-	}
+
+	_, err = bs.Get(context.TODO(), key)
+	c.Check(terror.ErrorEqual(err, ErrNotExist), IsTrue)
+
+	bs.Discard()
+	_, err = bs.Get(context.TODO(), key)
+	c.Check(terror.ErrorEqual(err, ErrNotExist), IsTrue)
+
 }

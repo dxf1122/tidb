@@ -14,25 +14,27 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"strings"
-	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/expression"
-	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/plugin"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/sessionctx/varsutil"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/chunk"
-	"github.com/pingcap/tidb/util/sqlexec"
-	log "github.com/sirupsen/logrus"
-	goctx "golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/collate"
+	"github.com/pingcap/tidb/util/gcutil"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/stmtsummary"
+	"github.com/pingcap/tidb/util/stringutil"
+	"go.uber.org/zap"
 )
 
 // SetExecutor executes set statement.
@@ -44,38 +46,27 @@ type SetExecutor struct {
 }
 
 // Next implements the Executor Next interface.
-func (e *SetExecutor) Next(goCtx goctx.Context) (Row, error) {
+func (e *SetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
+	req.Reset()
 	if e.done {
-		return nil, nil
-	}
-	err := e.executeSet()
-	if err != nil {
-		return nil, errors.Trace(err)
+		return nil
 	}
 	e.done = true
-	return nil, nil
-}
-
-// NextChunk implements the Executor NextChunk interface.
-func (e *SetExecutor) NextChunk(goCtx goctx.Context, chk *chunk.Chunk) error {
-	chk.Reset()
-	if !e.done {
-		e.done = true
-		err := e.executeSet()
-		return errors.Trace(err)
-	}
-	return nil
-}
-
-func (e *SetExecutor) executeSet() error {
 	sessionVars := e.ctx.GetSessionVars()
 	for _, v := range e.vars {
 		// Variable is case insensitive, we use lower case.
 		if v.Name == ast.SetNames {
 			// This is set charset stmt.
-			dt, err := v.Expr.(*expression.Constant).Eval(nil)
+			if v.IsDefault {
+				err := e.setCharset(mysql.DefaultCharset, "")
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			dt, err := v.Expr.(*expression.Constant).Eval(chunk.Row{})
 			if err != nil {
-				return errors.Trace(err)
+				return err
 			}
 			cs := dt.GetString()
 			var co string
@@ -84,16 +75,16 @@ func (e *SetExecutor) executeSet() error {
 			}
 			err = e.setCharset(cs, co)
 			if err != nil {
-				return errors.Trace(err)
+				return err
 			}
 			continue
 		}
 		name := strings.ToLower(v.Name)
 		if !v.IsSystem {
 			// Set user variable.
-			value, err := v.Expr.Eval(nil)
+			value, err := v.Expr.Eval(chunk.Row{})
 			if err != nil {
-				return errors.Trace(err)
+				return err
 			}
 
 			if value.IsNull() {
@@ -101,125 +92,168 @@ func (e *SetExecutor) executeSet() error {
 			} else {
 				svalue, err1 := value.ToString()
 				if err1 != nil {
-					return errors.Trace(err1)
+					return err1
 				}
-				sessionVars.Users[name] = fmt.Sprintf("%v", svalue)
+
+				sessionVars.SetUserVar(name, stringutil.Copy(svalue), value.Collation())
 			}
 			continue
 		}
 
+		syns := e.getSynonyms(name)
 		// Set system variable
-		sysVar := variable.GetSysVar(name)
-		if sysVar == nil {
-			return variable.UnknownSystemVar.GenByArgs(name)
-		}
-		if sysVar.Scope == variable.ScopeNone {
-			return errors.Errorf("Variable '%s' is a read only variable", name)
-		}
-		if v.IsGlobal {
-			// Set global scope system variable.
-			if sysVar.Scope&variable.ScopeGlobal == 0 {
-				return errors.Errorf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", name)
-			}
-			value, err := e.getVarValue(v, sysVar)
+		for _, n := range syns {
+			err := e.setSysVariable(n, v)
 			if err != nil {
-				return errors.Trace(err)
-			}
-			if value.IsNull() {
-				value.SetString("")
-			}
-			svalue, err := value.ToString()
-			if err != nil {
-				return errors.Trace(err)
-			}
-			err = sessionVars.GlobalVarsAccessor.SetGlobalSysVar(name, svalue)
-			if err != nil {
-				return errors.Trace(err)
-			}
-		} else {
-			// Set session scope system variable.
-			if sysVar.Scope&variable.ScopeSession == 0 {
-				return errors.Errorf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", name)
-			}
-			value, err := e.getVarValue(v, nil)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			oldSnapshotTS := sessionVars.SnapshotTS
-			err = varsutil.SetSessionSystemVar(sessionVars, name, value)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			newSnapshotIsSet := sessionVars.SnapshotTS > 0 && sessionVars.SnapshotTS != oldSnapshotTS
-			if newSnapshotIsSet {
-				err = validateSnapshot(e.ctx, sessionVars.SnapshotTS)
-				if err != nil {
-					sessionVars.SnapshotTS = oldSnapshotTS
-					return errors.Trace(err)
-				}
-			}
-			err = e.loadSnapshotInfoSchemaIfNeeded(name)
-			if err != nil {
-				sessionVars.SnapshotTS = oldSnapshotTS
-				return errors.Trace(err)
-			}
-			var valStr string
-			if value.IsNull() {
-				valStr = "NULL"
-			} else {
-				var err error
-				valStr, err = value.ToString()
-				terror.Log(errors.Trace(err))
-			}
-			log.Infof("[%d] set system variable %s = %s", sessionVars.ConnectionID, name, valStr)
-		}
-
-		if name == variable.TxnIsolation {
-			if sessionVars.Systems[variable.TxnIsolation] == ast.ReadCommitted {
-				e.ctx.Txn().SetOption(kv.IsolationLevel, kv.RC)
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-// validateSnapshot checks that the newly set snapshot time is after GC safe point time.
-func validateSnapshot(ctx context.Context, snapshotTS uint64) error {
-	sql := "SELECT variable_value FROM mysql.tidb WHERE variable_name = 'tikv_gc_safe_point'"
-	rows, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, sql)
-	if err != nil {
-		return errors.Trace(err)
+func (e *SetExecutor) getSynonyms(varName string) []string {
+	synonyms, ok := variable.SynonymsSysVariables[varName]
+	if ok {
+		return synonyms
 	}
-	if len(rows) != 1 {
-		return errors.New("can not get 'tikv_gc_safe_point'")
+
+	synonyms = []string{varName}
+	return synonyms
+}
+
+func (e *SetExecutor) setSysVariable(name string, v *expression.VarAssignment) error {
+	sessionVars := e.ctx.GetSessionVars()
+	sysVar := variable.GetSysVar(name)
+	if sysVar == nil {
+		return variable.ErrUnknownSystemVar.GenWithStackByArgs(name)
 	}
-	safePointString := rows[0].GetString(0)
-	const gcTimeFormat = "20060102-15:04:05 -0700 MST"
-	safePointTime, err := time.Parse(gcTimeFormat, safePointString)
-	if err != nil {
-		return errors.Trace(err)
+	if sysVar.Scope == variable.ScopeNone {
+		return errors.Errorf("Variable '%s' is a read only variable", name)
 	}
-	safePointTS := varsutil.GoTimeToTS(safePointTime)
-	if safePointTS > snapshotTS {
-		return variable.ErrSnapshotTooOld.GenByArgs(safePointString)
+	var valStr string
+	if v.IsGlobal {
+		// Set global scope system variable.
+		if sysVar.Scope&variable.ScopeGlobal == 0 {
+			return errors.Errorf("Variable '%s' is a SESSION variable and can't be used with SET GLOBAL", name)
+		}
+		value, err := e.getVarValue(v, sysVar)
+		if err != nil {
+			return err
+		}
+		if value.IsNull() {
+			value.SetString("", mysql.DefaultCollationName)
+		}
+		valStr, err = value.ToString()
+		if err != nil {
+			return err
+		}
+		err = sessionVars.GlobalVarsAccessor.SetGlobalSysVar(name, valStr)
+		if err != nil {
+			return err
+		}
+		err = plugin.ForeachPlugin(plugin.Audit, func(p *plugin.Plugin) error {
+			auditPlugin := plugin.DeclareAuditManifest(p.Manifest)
+			if auditPlugin.OnGlobalVariableEvent != nil {
+				auditPlugin.OnGlobalVariableEvent(context.Background(), e.ctx.GetSessionVars(), name, valStr)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		// Set session scope system variable.
+		if sysVar.Scope&variable.ScopeSession == 0 {
+			return errors.Errorf("Variable '%s' is a GLOBAL variable and should be set with SET GLOBAL", name)
+		}
+		value, err := e.getVarValue(v, nil)
+		if err != nil {
+			return err
+		}
+		oldSnapshotTS := sessionVars.SnapshotTS
+		if name == variable.TxnIsolationOneShot && sessionVars.InTxn() {
+			return errors.Trace(ErrCantChangeTxCharacteristics)
+		}
+		if name == variable.TiDBFoundInPlanCache {
+			sessionVars.StmtCtx.AppendWarning(fmt.Errorf("Set operation for '%s' will not take effect", variable.TiDBFoundInPlanCache))
+			return nil
+		}
+		err = variable.SetSessionSystemVar(sessionVars, name, value)
+		if err != nil {
+			return err
+		}
+		newSnapshotIsSet := sessionVars.SnapshotTS > 0 && sessionVars.SnapshotTS != oldSnapshotTS
+		if newSnapshotIsSet {
+			err = gcutil.ValidateSnapshot(e.ctx, sessionVars.SnapshotTS)
+			if err != nil {
+				sessionVars.SnapshotTS = oldSnapshotTS
+				return err
+			}
+		}
+		err = e.loadSnapshotInfoSchemaIfNeeded(name)
+		if err != nil {
+			sessionVars.SnapshotTS = oldSnapshotTS
+			return err
+		}
+		if value.IsNull() {
+			valStr = "NULL"
+		} else {
+			var err error
+			valStr, err = value.ToString()
+			terror.Log(err)
+		}
+		if name != variable.AutoCommit {
+			logutil.BgLogger().Info("set session var", zap.Uint64("conn", sessionVars.ConnectionID), zap.String("name", name), zap.String("val", valStr))
+		} else {
+			// Some applications will set `autocommit` variable before query.
+			// This will print too many unnecessary log info.
+			logutil.BgLogger().Debug("set session var", zap.Uint64("conn", sessionVars.ConnectionID), zap.String("name", name), zap.String("val", valStr))
+		}
 	}
+
+	switch name {
+	case variable.TiDBEnableStmtSummary:
+		return stmtsummary.StmtSummaryByDigestMap.SetEnabled(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryInternalQuery:
+		return stmtsummary.StmtSummaryByDigestMap.SetEnabledInternalQuery(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryRefreshInterval:
+		return stmtsummary.StmtSummaryByDigestMap.SetRefreshInterval(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryHistorySize:
+		return stmtsummary.StmtSummaryByDigestMap.SetHistorySize(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryMaxStmtCount:
+		return stmtsummary.StmtSummaryByDigestMap.SetMaxStmtCount(valStr, !v.IsGlobal)
+	case variable.TiDBStmtSummaryMaxSQLLength:
+		return stmtsummary.StmtSummaryByDigestMap.SetMaxSQLLength(valStr, !v.IsGlobal)
+	case variable.TiDBCapturePlanBaseline:
+		variable.CapturePlanBaseline.Set(strings.ToLower(valStr), !v.IsGlobal)
+	}
+
 	return nil
 }
 
 func (e *SetExecutor) setCharset(cs, co string) error {
 	var err error
 	if len(co) == 0 {
-		co, err = charset.GetDefaultCollation(cs)
-		if err != nil {
-			return errors.Trace(err)
+		if co, err = charset.GetDefaultCollation(cs); err != nil {
+			return err
+		}
+	} else {
+		var coll *charset.Collation
+		if coll, err = collate.GetCollationByName(co); err != nil {
+			return err
+		}
+		if coll.CharsetName != cs {
+			return charset.ErrCollationCharsetMismatch.GenWithStackByArgs(coll.Name, cs)
 		}
 	}
 	sessionVars := e.ctx.GetSessionVars()
 	for _, v := range variable.SetNamesVariables {
-		sessionVars.Systems[v] = cs
+		if err = sessionVars.SetSystemVar(v, cs); err != nil {
+			return errors.Trace(err)
+		}
 	}
-	sessionVars.Systems[variable.CollationConnection] = co
-	return nil
+	return errors.Trace(sessionVars.SetSystemVar(variable.CollationConnection, co))
 }
 
 func (e *SetExecutor) getVarValue(v *expression.VarAssignment, sysVar *variable.SysVar) (value types.Datum, err error) {
@@ -230,16 +264,16 @@ func (e *SetExecutor) getVarValue(v *expression.VarAssignment, sysVar *variable.
 		if sysVar != nil {
 			value = types.NewStringDatum(sysVar.Value)
 		} else {
-			s, err1 := varsutil.GetGlobalSystemVar(e.ctx.GetSessionVars(), v.Name)
+			s, err1 := variable.GetGlobalSystemVar(e.ctx.GetSessionVars(), v.Name)
 			if err1 != nil {
-				return value, errors.Trace(err1)
+				return value, err1
 			}
 			value = types.NewStringDatum(s)
 		}
 		return
 	}
-	value, err = v.Expr.Eval(nil)
-	return value, errors.Trace(err)
+	value, err = v.Expr.Eval(chunk.Row{})
+	return value, err
 }
 
 func (e *SetExecutor) loadSnapshotInfoSchemaIfNeeded(name string) error {
@@ -251,11 +285,11 @@ func (e *SetExecutor) loadSnapshotInfoSchemaIfNeeded(name string) error {
 		vars.SnapshotInfoschema = nil
 		return nil
 	}
-	log.Infof("[%d] loadSnapshotInfoSchema, SnapshotTS:%d", vars.ConnectionID, vars.SnapshotTS)
+	logutil.BgLogger().Info("load snapshot info schema", zap.Uint64("conn", vars.ConnectionID), zap.Uint64("SnapshotTS", vars.SnapshotTS))
 	dom := domain.GetDomain(e.ctx)
 	snapInfo, err := dom.GetSnapshotInfoSchema(vars.SnapshotTS)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	vars.SnapshotInfoschema = snapInfo
 	return nil

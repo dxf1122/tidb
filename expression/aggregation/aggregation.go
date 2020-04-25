@@ -15,95 +15,35 @@ package aggregation
 
 import (
 	"bytes"
-	"encoding/json"
-	"fmt"
 	"strings"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 // Aggregation stands for aggregate functions.
 type Aggregation interface {
-	fmt.Stringer
-	json.Marshaler
-
 	// Update during executing.
-	Update(ctx *AggEvaluateContext, sc *stmtctx.StatementContext, row types.Row) error
+	Update(evalCtx *AggEvaluateContext, sc *stmtctx.StatementContext, row chunk.Row) error
 
 	// GetPartialResult will called by coprocessor to get partial results. For avg function, partial results will return
 	// sum and count values at the same time.
-	GetPartialResult(ctx *AggEvaluateContext) []types.Datum
-
-	// SetMode sets aggFunctionMode for aggregate function.
-	SetMode(mode AggFunctionMode)
-
-	// GetMode gets aggFunctionMode from aggregate function.
-	GetMode() AggFunctionMode
+	GetPartialResult(evalCtx *AggEvaluateContext) []types.Datum
 
 	// GetResult will be called when all data have been processed.
-	GetResult(ctx *AggEvaluateContext) types.Datum
+	GetResult(evalCtx *AggEvaluateContext) types.Datum
 
-	// GetArgs stands for getting all arguments.
-	GetArgs() []expression.Expression
+	// CreateContext creates a new AggEvaluateContext for the aggregation function.
+	CreateContext(sc *stmtctx.StatementContext) *AggEvaluateContext
 
-	// GetName gets the aggregation function name.
-	GetName() string
-
-	// SetArgs sets argument by index.
-	SetArgs(args []expression.Expression)
-
-	// Create a new AggEvaluateContext for the aggregation function.
-	CreateContext() *AggEvaluateContext
-
-	// IsDistinct indicates if the aggregate function contains distinct attribute.
-	IsDistinct() bool
-
-	// Equal checks whether two aggregation functions are equal.
-	Equal(agg Aggregation, ctx context.Context) bool
-
-	// Clone copies an aggregate function totally.
-	Clone() Aggregation
-
-	// GetType gets field type of aggregate function.
-	GetType() *types.FieldType
-
-	// CalculateDefaultValue gets the default value when the aggregate function's input is null.
-	// The input stands for the schema of Aggregation's child. If the function can't produce a default value, the second
-	// return value will be false.
-	CalculateDefaultValue(schema *expression.Schema, ctx context.Context) (types.Datum, bool)
-}
-
-// NewAggFunction creates a new Aggregation.
-func NewAggFunction(funcType string, funcArgs []expression.Expression, distinct bool) Aggregation {
-	switch tp := strings.ToLower(funcType); tp {
-	case ast.AggFuncSum:
-		return &sumFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	case ast.AggFuncCount:
-		return &countFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	case ast.AggFuncAvg:
-		return &avgFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	case ast.AggFuncGroupConcat:
-		return &concatFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	case ast.AggFuncMax:
-		return &maxMinFunction{aggFunction: newAggFunc(tp, funcArgs, distinct), isMax: true}
-	case ast.AggFuncMin:
-		return &maxMinFunction{aggFunction: newAggFunc(tp, funcArgs, distinct), isMax: false}
-	case ast.AggFuncFirstRow:
-		return &firstRowFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	case ast.AggFuncBitOr:
-		return &bitOrFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	case ast.AggFuncBitXor:
-		return &bitXorFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	case ast.AggFuncBitAnd:
-		return &bitAndFunction{aggFunction: newAggFunc(tp, funcArgs, distinct)}
-	}
-	return nil
+	// ResetContext resets the content of the evaluate context.
+	ResetContext(sc *stmtctx.StatementContext, evalCtx *AggEvaluateContext)
 }
 
 // NewDistAggFunc creates new Aggregate function for mock tikv.
@@ -112,7 +52,7 @@ func NewDistAggFunc(expr *tipb.Expr, fieldTps []*types.FieldType, sc *stmtctx.St
 	for _, child := range expr.Children {
 		arg, err := expression.PBToExpr(child, fieldTps, sc)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		args = append(args, arg)
 	}
@@ -153,132 +93,120 @@ type AggEvaluateContext struct {
 // AggFunctionMode stands for the aggregation function's mode.
 type AggFunctionMode int
 
+// |-----------------|--------------|--------------|
+// | AggFunctionMode | input        | output       |
+// |-----------------|--------------|--------------|
+// | CompleteMode    | origin data  | final result |
+// | FinalMode       | partial data | final result |
+// | Partial1Mode    | origin data  | partial data |
+// | Partial2Mode    | partial data | partial data |
+// | DedupMode       | origin data  | origin data  |
+// |-----------------|--------------|--------------|
 const (
-	// CompleteMode function accepts origin data.
 	CompleteMode AggFunctionMode = iota
-	// FinalMode function accepts partial data.
 	FinalMode
+	Partial1Mode
+	Partial2Mode
+	DedupMode
 )
 
 type aggFunction struct {
-	name     string
-	mode     AggFunctionMode
-	Args     []expression.Expression
-	Distinct bool
+	*AggFuncDesc
 }
 
-// Equal implements Aggregation interface.
-func (af *aggFunction) Equal(b Aggregation, ctx context.Context) bool {
-	if af.GetName() != b.GetName() {
+func newAggFunc(funcName string, args []expression.Expression, hasDistinct bool) aggFunction {
+	agg := &AggFuncDesc{HasDistinct: hasDistinct}
+	agg.Name = funcName
+	agg.Args = args
+	return aggFunction{AggFuncDesc: agg}
+}
+
+// CreateContext implements Aggregation interface.
+func (af *aggFunction) CreateContext(sc *stmtctx.StatementContext) *AggEvaluateContext {
+	evalCtx := &AggEvaluateContext{}
+	if af.HasDistinct {
+		evalCtx.DistinctChecker = createDistinctChecker(sc)
+	}
+	return evalCtx
+}
+
+func (af *aggFunction) ResetContext(sc *stmtctx.StatementContext, evalCtx *AggEvaluateContext) {
+	if af.HasDistinct {
+		evalCtx.DistinctChecker = createDistinctChecker(sc)
+	}
+	evalCtx.Value.SetNull()
+}
+
+func (af *aggFunction) updateSum(sc *stmtctx.StatementContext, evalCtx *AggEvaluateContext, row chunk.Row) error {
+	a := af.Args[0]
+	value, err := a.Eval(row)
+	if err != nil {
+		return err
+	}
+	if value.IsNull() {
+		return nil
+	}
+	if af.HasDistinct {
+		d, err1 := evalCtx.DistinctChecker.Check([]types.Datum{value})
+		if err1 != nil {
+			return err1
+		}
+		if !d {
+			return nil
+		}
+	}
+	evalCtx.Value, err = calculateSum(sc, evalCtx.Value, value)
+	if err != nil {
+		return err
+	}
+	evalCtx.Count++
+	return nil
+}
+
+// NeedCount indicates whether the aggregate function should record count.
+func NeedCount(name string) bool {
+	return name == ast.AggFuncCount || name == ast.AggFuncAvg
+}
+
+// NeedValue indicates whether the aggregate function should record value.
+func NeedValue(name string) bool {
+	switch name {
+	case ast.AggFuncSum, ast.AggFuncAvg, ast.AggFuncFirstRow, ast.AggFuncMax, ast.AggFuncMin,
+		ast.AggFuncGroupConcat, ast.AggFuncBitOr, ast.AggFuncBitAnd, ast.AggFuncBitXor:
+		return true
+	default:
 		return false
 	}
-	if af.Distinct != b.IsDistinct() {
-		return false
-	}
-	if len(af.GetArgs()) != len(b.GetArgs()) {
-		return false
-	}
-	for i, argA := range af.GetArgs() {
-		if !argA.Equal(b.GetArgs()[i], ctx) {
+}
+
+// IsAllFirstRow checks whether functions in `aggFuncs` are all FirstRow.
+func IsAllFirstRow(aggFuncs []*AggFuncDesc) bool {
+	for _, fun := range aggFuncs {
+		if fun.Name != ast.AggFuncFirstRow {
 			return false
 		}
 	}
 	return true
 }
 
-// String implements fmt.Stringer interface.
-func (af *aggFunction) String() string {
-	result := af.name + "("
-	for i, arg := range af.Args {
-		result += arg.String()
-		if i+1 != len(af.Args) {
-			result += ", "
-		}
+// CheckAggPushDown checks whether an agg function can be pushed to storage.
+func CheckAggPushDown(aggFunc *AggFuncDesc, storeType kv.StoreType) bool {
+	ret := true
+	switch storeType {
+	case kv.TiFlash:
+		ret = CheckAggPushFlash(aggFunc)
 	}
-	result += ")"
-	return result
-}
-
-// MarshalJSON implements json.Marshaler interface.
-func (af *aggFunction) MarshalJSON() ([]byte, error) {
-	buffer := bytes.NewBufferString(fmt.Sprintf("\"%s\"", af))
-	return buffer.Bytes(), nil
-}
-
-func newAggFunc(name string, args []expression.Expression, dist bool) aggFunction {
-	return aggFunction{
-		name:     name,
-		Args:     args,
-		Distinct: dist,
+	if ret {
+		ret = expression.IsPushDownEnabled(strings.ToLower(aggFunc.Name), storeType)
 	}
+	return ret
 }
 
-// CalculateDefaultValue implements Aggregation interface.
-func (af *aggFunction) CalculateDefaultValue(schema *expression.Schema, ctx context.Context) (types.Datum, bool) {
-	return types.Datum{}, false
-}
-
-// IsDistinct implements Aggregation interface.
-func (af *aggFunction) IsDistinct() bool {
-	return af.Distinct
-}
-
-// GetName implements Aggregation interface.
-func (af *aggFunction) GetName() string {
-	return af.name
-}
-
-// SetMode implements Aggregation interface.
-func (af *aggFunction) SetMode(mode AggFunctionMode) {
-	af.mode = mode
-}
-
-// GetMode implements Aggregation interface.
-func (af *aggFunction) GetMode() AggFunctionMode {
-	return af.mode
-}
-
-// GetArgs implements Aggregation interface.
-func (af *aggFunction) GetArgs() []expression.Expression {
-	return af.Args
-}
-
-// SetArgs implements Aggregation interface.
-func (af *aggFunction) SetArgs(args []expression.Expression) {
-	af.Args = args
-}
-
-// CreateContext implements Aggregation interface.
-func (af *aggFunction) CreateContext() *AggEvaluateContext {
-	ctx := &AggEvaluateContext{}
-	if af.Distinct {
-		ctx.DistinctChecker = createDistinctChecker()
+// CheckAggPushFlash checks whether an agg function can be pushed to flash storage.
+func CheckAggPushFlash(aggFunc *AggFuncDesc) bool {
+	switch aggFunc.Name {
+	case ast.AggFuncSum, ast.AggFuncCount, ast.AggFuncMin, ast.AggFuncMax, ast.AggFuncAvg, ast.AggFuncFirstRow:
+		return true
 	}
-	return ctx
-}
-
-func (af *aggFunction) updateSum(ctx *AggEvaluateContext, sc *stmtctx.StatementContext, row types.Row) error {
-	a := af.Args[0]
-	value, err := a.Eval(row)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	if value.IsNull() {
-		return nil
-	}
-	if af.Distinct {
-		d, err1 := ctx.DistinctChecker.Check([]types.Datum{value})
-		if err1 != nil {
-			return errors.Trace(err1)
-		}
-		if !d {
-			return nil
-		}
-	}
-	ctx.Value, err = calculateSum(sc, ctx.Value, value)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	ctx.Count++
-	return nil
+	return false
 }

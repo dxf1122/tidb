@@ -15,6 +15,7 @@ package types
 
 import (
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/util/testleak"
 )
 
@@ -105,6 +106,9 @@ func (s *testBinaryLiteralSuite) TestParseBitStr(c *C) {
 			c.Assert([]byte(b), DeepEquals, t.Expected, Commentf("%#v", t))
 		}
 	}
+	b, err := ParseBitStr("")
+	c.Assert(b, IsNil)
+	c.Assert(err, ErrorMatches, "invalid empty .*")
 }
 
 func (s *testBinaryLiteralSuite) TestParseHexStr(c *C) {
@@ -138,6 +142,9 @@ func (s *testBinaryLiteralSuite) TestParseHexStr(c *C) {
 			c.Assert([]byte(hex), DeepEquals, t.Expected, Commentf("%#v", t))
 		}
 	}
+	hex, err := ParseHexStr("")
+	c.Assert(hex, IsNil)
+	c.Assert(err, ErrorMatches, "invalid empty .*")
 }
 
 func (s *testBinaryLiteralSuite) TestString(c *C) {
@@ -199,10 +206,11 @@ func (s *testBinaryLiteralSuite) TestToInt(c *C) {
 		{"0x1010ffff8080ff12", 0x1010ffff8080ff12, false},
 		{"0x1010ffff8080ff12ff", 0xffffffffffffffff, true},
 	}
+	sc := new(stmtctx.StatementContext)
 	for _, t := range tbl {
 		hex, err := ParseHexStr(t.Input)
 		c.Assert(err, IsNil)
-		intValue, err := hex.ToInt()
+		intValue, err := hex.ToInt(sc)
 		if t.HasError {
 			c.Assert(err, NotNil)
 		} else {
@@ -241,4 +249,36 @@ func (s *testBinaryLiteralSuite) TestNewBinaryLiteralFromUint(c *C) {
 		hex := NewBinaryLiteralFromUint(t.Input, t.ByteSize)
 		c.Assert([]byte(hex), DeepEquals, t.Expected, Commentf("%#v", t))
 	}
+
+	defer func() {
+		r := recover()
+		c.Assert(r, NotNil)
+	}()
+	NewBinaryLiteralFromUint(0x123, -2)
+}
+
+func (s *testBinaryLiteralSuite) TestCompare(c *C) {
+	tbl := []struct {
+		a   BinaryLiteral
+		b   BinaryLiteral
+		cmp int
+	}{
+		{BinaryLiteral{0, 0, 1}, BinaryLiteral{2}, -1},
+		{BinaryLiteral{0, 1}, BinaryLiteral{0, 0, 2}, -1},
+		{BinaryLiteral{0, 1}, BinaryLiteral{1}, 0},
+		{BinaryLiteral{0, 2, 1}, BinaryLiteral{1, 2}, 1},
+	}
+	for _, t := range tbl {
+		c.Assert(t.a.Compare(t.b), Equals, t.cmp)
+	}
+}
+
+func (s *testBinaryLiteralSuite) TestToString(c *C) {
+	h, _ := NewHexLiteral("x'3A3B'")
+	str := h.ToString()
+	c.Assert(str, Equals, ":;")
+
+	b, _ := NewBitLiteral("b'00101011'")
+	str = b.ToString()
+	c.Assert(str, Equals, "+")
 }

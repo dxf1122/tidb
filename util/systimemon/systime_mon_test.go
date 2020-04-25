@@ -17,7 +17,13 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	. "github.com/pingcap/check"
 )
+
+func TestT(t *testing.T) {
+	TestingT(t)
+}
 
 func TestSystimeMonitor(t *testing.T) {
 	var jumpForward int32
@@ -33,7 +39,7 @@ func TestSystimeMonitor(t *testing.T) {
 			return time.Now().Add(-2 * time.Second)
 		}, func() {
 			atomic.StoreInt32(&jumpForward, 1)
-		})
+		}, func() {})
 
 	time.Sleep(1 * time.Second)
 

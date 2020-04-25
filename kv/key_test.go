@@ -15,8 +15,12 @@ package kv
 
 import (
 	"bytes"
+	"errors"
+	"testing"
+	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/testleak"
@@ -29,13 +33,15 @@ type testKeySuite struct {
 
 func (s *testKeySuite) TestPartialNext(c *C) {
 	defer testleak.AfterTest(c)()
+	sc := &stmtctx.StatementContext{TimeZone: time.Local}
 	// keyA represents a multi column index.
-	keyA, err := codec.EncodeValue(nil, types.NewDatum("abc"), types.NewDatum("def"))
+	keyA, err := codec.EncodeValue(sc, nil, types.NewDatum("abc"), types.NewDatum("def"))
 	c.Check(err, IsNil)
-	keyB, err := codec.EncodeValue(nil, types.NewDatum("abca"), types.NewDatum("def"))
+	keyB, err := codec.EncodeValue(sc, nil, types.NewDatum("abca"), types.NewDatum("def"))
+	c.Check(err, IsNil)
 
 	// We only use first column value to seek.
-	seekKey, err := codec.EncodeValue(nil, types.NewDatum("abc"))
+	seekKey, err := codec.EncodeValue(sc, nil, types.NewDatum("abc"))
 	c.Check(err, IsNil)
 
 	nextKey := Key(seekKey).Next()
@@ -52,18 +58,99 @@ func (s *testKeySuite) TestPartialNext(c *C) {
 }
 
 func (s *testKeySuite) TestIsPoint(c *C) {
+	tests := []struct {
+		start   []byte
+		end     []byte
+		isPoint bool
+	}{
+		{
+			start:   Key("rowkey1"),
+			end:     Key("rowkey2"),
+			isPoint: true,
+		},
+		{
+			start:   Key("rowkey1"),
+			end:     Key("rowkey3"),
+			isPoint: false,
+		},
+		{
+			start:   Key(""),
+			end:     []byte{0},
+			isPoint: true,
+		},
+		{
+			start:   []byte{123, 123, 255, 255},
+			end:     []byte{123, 124, 0, 0},
+			isPoint: true,
+		},
+		{
+			start:   []byte{123, 123, 255, 255},
+			end:     []byte{123, 124, 0, 1},
+			isPoint: false,
+		},
+		{
+			start:   []byte{123, 123},
+			end:     []byte{123, 123, 0},
+			isPoint: true,
+		},
+		{
+			start:   []byte{255},
+			end:     []byte{0},
+			isPoint: false,
+		},
+	}
+	for _, tt := range tests {
+		kr := KeyRange{
+			StartKey: tt.start,
+			EndKey:   tt.end,
+		}
+		c.Check(kr.IsPoint(), Equals, tt.isPoint)
+	}
+}
+
+func (s *testKeySuite) TestBasicFunc(c *C) {
+	c.Assert(IsTxnRetryableError(nil), IsFalse)
+	c.Assert(IsTxnRetryableError(ErrTxnRetryable), IsTrue)
+	c.Assert(IsTxnRetryableError(errors.New("test")), IsFalse)
+}
+
+func (s *testKeySuite) TestHandle(c *C) {
+	ih := IntHandle(100)
+	c.Assert(ih.IsInt(), IsTrue)
+	_, iv, _ := codec.DecodeInt(ih.Encoded())
+	c.Assert(iv, Equals, ih.IntValue())
+	ih2 := ih.Next()
+	c.Assert(ih2.IntValue(), Equals, int64(101))
+	c.Assert(ih.Equal(ih2), IsFalse)
+	c.Assert(ih.Compare(ih2), Equals, -1)
+	c.Assert(ih.String(), Equals, "100")
+
+	encoded, err := codec.EncodeKey(new(stmtctx.StatementContext), nil, types.NewIntDatum(100), types.NewStringDatum("abc"))
+	c.Assert(err, IsNil)
+	ch, err := NewCommonHandle(encoded)
+	c.Assert(err, IsNil)
+	c.Assert(ch.IsInt(), IsFalse)
+	ch2 := ch.Next()
+	c.Assert(ch.Equal(ch2), IsFalse)
+	c.Assert(ch.Compare(ch2), Equals, -1)
+	c.Assert(ch2.Encoded(), HasLen, len(ch.Encoded()))
+	c.Assert(ch.NumCols(), Equals, 2)
+	_, d, err := codec.DecodeOne(ch.EncodedCol(0))
+	c.Assert(err, IsNil)
+	c.Assert(d.GetInt64(), Equals, int64(100))
+	_, d, err = codec.DecodeOne(ch.EncodedCol(1))
+	c.Assert(err, IsNil)
+	c.Assert(d.GetString(), Equals, "abc")
+	c.Assert(ch.String(), Equals, "{100, abc}")
+}
+
+func BenchmarkIsPoint(b *testing.B) {
+	b.ReportAllocs()
 	kr := KeyRange{
-		StartKey: Key("rowkey1"),
-		EndKey:   Key("rowkey2"),
+		StartKey: []byte("rowkey1"),
+		EndKey:   []byte("rowkey2"),
 	}
-	c.Check(kr.IsPoint(), IsTrue)
-
-	kr.EndKey = Key("rowkey3")
-	c.Check(kr.IsPoint(), IsFalse)
-
-	kr = KeyRange{
-		StartKey: Key(""),
-		EndKey:   Key([]byte{0}),
+	for i := 0; i < b.N; i++ {
+		kr.IsPoint()
 	}
-	c.Check(kr.IsPoint(), IsTrue)
 }

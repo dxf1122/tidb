@@ -16,70 +16,73 @@
 package kv
 
 import (
+	"bytes"
+	"context"
 	"sync/atomic"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/goleveldb/leveldb"
-	"github.com/pingcap/goleveldb/leveldb/comparer"
-	"github.com/pingcap/goleveldb/leveldb/iterator"
-	"github.com/pingcap/goleveldb/leveldb/memdb"
-	"github.com/pingcap/goleveldb/leveldb/util"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/kv/memdb"
 )
 
-// memDBBuffer implements the MemBuffer interface.
+// memDbBuffer implements the MemBuffer interface.
 type memDbBuffer struct {
-	db              *memdb.DB
+	sandbox         *memdb.Sandbox
 	entrySizeLimit  int
 	bufferLenLimit  uint64
-	bufferSizeLimit int
+	bufferSizeLimit uint64
 }
 
 type memDbIter struct {
-	iter    iterator.Iterator
+	iter    memdb.Iterator
+	start   []byte
+	end     []byte
 	reverse bool
 }
 
 // NewMemDbBuffer creates a new memDbBuffer.
 func NewMemDbBuffer() MemBuffer {
 	return &memDbBuffer{
-		db:              memdb.New(comparer.DefaultComparer, 4*1024),
+		sandbox:         memdb.NewSandbox(),
 		entrySizeLimit:  TxnEntrySizeLimit,
-		bufferLenLimit:  atomic.LoadUint64(&TxnEntryCountLimit),
-		bufferSizeLimit: TxnTotalSizeLimit,
+		bufferSizeLimit: atomic.LoadUint64(&TxnTotalSizeLimit),
 	}
 }
 
-// Seek creates an Iterator.
-func (m *memDbBuffer) Seek(k Key) (Iterator, error) {
-	var i Iterator
-	if k == nil {
-		i = &memDbIter{iter: m.db.NewIterator(&util.Range{}), reverse: false}
-	} else {
-		i = &memDbIter{iter: m.db.NewIterator(&util.Range{Start: []byte(k)}), reverse: false}
+// Iter creates an Iterator.
+func (m *memDbBuffer) Iter(k Key, upperBound Key) (Iterator, error) {
+	i := &memDbIter{
+		iter:    m.sandbox.NewIterator(),
+		start:   k,
+		end:     upperBound,
+		reverse: false,
 	}
-	err := i.Next()
-	if err != nil {
-		return nil, errors.Trace(err)
+
+	if k == nil {
+		i.iter.SeekToFirst()
+	} else {
+		i.iter.Seek(k)
 	}
 	return i, nil
 }
 
-func (m *memDbBuffer) SeekReverse(k Key) (Iterator, error) {
-	var i *memDbIter
-	if k == nil {
-		i = &memDbIter{iter: m.db.NewIterator(&util.Range{}), reverse: true}
-	} else {
-		i = &memDbIter{iter: m.db.NewIterator(&util.Range{Limit: []byte(k)}), reverse: true}
+func (m *memDbBuffer) IterReverse(k Key) (Iterator, error) {
+	i := &memDbIter{
+		iter:    m.sandbox.NewIterator(),
+		end:     k,
+		reverse: true,
 	}
-	i.iter.Last()
+	if k == nil {
+		i.iter.SeekToLast()
+	} else {
+		i.iter.SeekForExclusivePrev(k)
+	}
 	return i, nil
 }
 
 // Get returns the value associated with key.
-func (m *memDbBuffer) Get(k Key) ([]byte, error) {
-	v, err := m.db.Get(k)
-	if terror.ErrorEqual(err, leveldb.ErrNotFound) {
+func (m *memDbBuffer) Get(ctx context.Context, k Key) ([]byte, error) {
+	v := m.sandbox.Get(k)
+	if v == nil {
 		return nil, ErrNotExist
 	}
 	return v, nil
@@ -91,33 +94,51 @@ func (m *memDbBuffer) Set(k Key, v []byte) error {
 		return errors.Trace(ErrCannotSetNilValue)
 	}
 	if len(k)+len(v) > m.entrySizeLimit {
-		return ErrEntryTooLarge.Gen("entry too large, size: %d", len(k)+len(v))
+		return ErrEntryTooLarge.GenWithStackByArgs(m.entrySizeLimit, len(k)+len(v))
 	}
 
-	err := m.db.Put(k, v)
-	if m.Size() > m.bufferSizeLimit {
-		return ErrTxnTooLarge.Gen("transaction too large, size:%d", m.Size())
+	m.sandbox.Put(k, v)
+	if m.Size() > int(m.bufferSizeLimit) {
+		return ErrTxnTooLarge.GenWithStackByArgs(m.Size())
 	}
-	if m.Len() > int(m.bufferLenLimit) {
-		return ErrTxnTooLarge.Gen("transaction too large, len:%d", m.Len())
-	}
-	return errors.Trace(err)
+	return nil
 }
 
 // Delete removes the entry from buffer with provided key.
 func (m *memDbBuffer) Delete(k Key) error {
-	err := m.db.Put(k, nil)
-	return errors.Trace(err)
+	m.sandbox.Put(k, nil)
+	if m.Size() > int(m.bufferSizeLimit) {
+		return ErrTxnTooLarge.GenWithStackByArgs(m.Size())
+	}
+	return nil
 }
 
 // Size returns sum of keys and values length.
 func (m *memDbBuffer) Size() int {
-	return m.db.Size()
+	return m.sandbox.Size()
 }
 
 // Len returns the number of entries in the DB.
 func (m *memDbBuffer) Len() int {
-	return m.db.Len()
+	return m.sandbox.Len()
+}
+
+func (m *memDbBuffer) NewStagingBuffer() MemBuffer {
+	return &memDbBuffer{
+		sandbox:         m.sandbox.Derive(),
+		entrySizeLimit:  TxnEntrySizeLimit,
+		bufferSizeLimit: m.bufferSizeLimit - uint64(m.sandbox.Size()),
+	}
+}
+
+func (m *memDbBuffer) Flush() (int, error) {
+	// There is no need to check size limit,
+	// because the size limit is maintain when derive this buffer.
+	return m.sandbox.Flush(), nil
+}
+
+func (m *memDbBuffer) Discard() {
+	m.sandbox.Discard()
 }
 
 // Next implements the Iterator Next.
@@ -132,6 +153,9 @@ func (i *memDbIter) Next() error {
 
 // Valid implements the Iterator Valid.
 func (i *memDbIter) Valid() bool {
+	if !i.reverse {
+		return i.iter.Valid() && (i.end == nil || bytes.Compare(i.Key(), i.end) < 0)
+	}
 	return i.iter.Valid()
 }
 
@@ -147,12 +171,12 @@ func (i *memDbIter) Value() []byte {
 
 // Close Implements the Iterator Close.
 func (i *memDbIter) Close() {
-	i.iter.Release()
+
 }
 
 // WalkMemBuffer iterates all buffered kv pairs in memBuf
 func WalkMemBuffer(memBuf MemBuffer, f func(k Key, v []byte) error) error {
-	iter, err := memBuf.Seek(nil)
+	iter, err := memBuf.Iter(nil, nil)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -169,4 +193,54 @@ func WalkMemBuffer(memBuf MemBuffer, f func(k Key, v []byte) error) error {
 	}
 
 	return nil
+}
+
+// BufferBatchGetter is the type for BatchGet with MemBuffer.
+type BufferBatchGetter struct {
+	buffer   MemBuffer
+	middle   Getter
+	snapshot Snapshot
+}
+
+// NewBufferBatchGetter creates a new BufferBatchGetter.
+func NewBufferBatchGetter(buffer MemBuffer, middleCache Getter, snapshot Snapshot) *BufferBatchGetter {
+	return &BufferBatchGetter{buffer: buffer, middle: middleCache, snapshot: snapshot}
+}
+
+// BatchGet implements the BatchGetter interface.
+func (b *BufferBatchGetter) BatchGet(ctx context.Context, keys []Key) (map[string][]byte, error) {
+	if b.buffer.Len() == 0 {
+		return b.snapshot.BatchGet(ctx, keys)
+	}
+	bufferValues := make([][]byte, len(keys))
+	shrinkKeys := make([]Key, 0, len(keys))
+	for i, key := range keys {
+		val, err := b.buffer.Get(ctx, key)
+		if err == nil {
+			bufferValues[i] = val
+			continue
+		}
+		if !IsErrNotFound(err) {
+			return nil, errors.Trace(err)
+		}
+		if b.middle != nil {
+			val, err = b.middle.Get(ctx, key)
+			if err == nil {
+				bufferValues[i] = val
+				continue
+			}
+		}
+		shrinkKeys = append(shrinkKeys, key)
+	}
+	storageValues, err := b.snapshot.BatchGet(ctx, shrinkKeys)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	for i, key := range keys {
+		if len(bufferValues[i]) == 0 {
+			continue
+		}
+		storageValues[string(key)] = bufferValues[i]
+	}
+	return storageValues, nil
 }
